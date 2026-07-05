@@ -147,7 +147,6 @@ class MultiheadAttention(nn.Module):
         K = _to_multihead(self.proj_k(key),   self.emb_dim, self.num_heads)
         V = _to_multihead(self.proj_v(value), self.emb_dim, self.num_heads)
 
-        # TODO: apply RoPE here — Q, K = self.rope(Q, K)
         if self.rope is not None:
             Q, K = self.rope(Q, K)
 
