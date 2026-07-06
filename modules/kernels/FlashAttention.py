@@ -156,7 +156,7 @@ def flash_attn_forward(
 
     return O, L
 
-@triton.autotune(configs=get_cuda_configs(), key=['N_Q', 'N_KV', 'DIM'])
+@triton.autotune(configs=get_cuda_configs(), key=['N_Q', 'N_KV', 'DIM'], reset_to_zero=['dq_ptr'])
 @triton.jit
 def flash_attn_backward_kernel(
         q_ptr, 
