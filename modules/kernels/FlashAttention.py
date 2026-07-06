@@ -95,7 +95,7 @@ def flash_attn_forward_kernel(
     l_mask = qo_row_idx < N_Q
     
     tl.store(o_ptr + o_offsets, O, mask=qo_mask)
-    tl.store(l_ptr + l_offsets, L[:, 0], mask=l_mask)
+    tl.store(l_ptr + l_offsets, tl.reshape(L, [BLOCK_SIZE_Q]), mask=l_mask)
 
 def flash_attn_forward(
         Q: torch.Tensor, 
