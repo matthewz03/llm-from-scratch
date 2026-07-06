@@ -163,7 +163,7 @@ def flash_attn_backward_kernel(
         k_ptr, 
         v_ptr,
         do_ptr,
-        # m_ptr,
+        d_ptr,
         l_ptr,
         dq_ptr,
         dk_ptr,
@@ -182,6 +182,7 @@ def flash_attn_backward_kernel(
         dk_col_stride,
         dv_row_stride,
         dv_col_stride,
+        d_stride,
         l_stride, # l.shape is (N_Q,)
         N_Q,
         N_KV,
@@ -262,9 +263,13 @@ def flash_attn_backward_kernel(
         # m = m[:, None]
 
         l_offsets = qo_row_idx * l_stride
-        l_mask = qo_row_idx < N_Q
-        L = tl.load(l_ptr + l_offsets, mask=l_mask)
+        d_offsets = qo_row_idx * d_stride
+        ld_mask = qo_row_idx < N_Q
+
+        L = tl.load(l_ptr + l_offsets, mask=ld_mask)
         L = L[:, None]
+        D = tl.load(d_ptr + d_offsets, mask=ld_mask)
+        D = D[:, None]
 
         # L = m + ln(sum)
         # exp(s - L) = exp(s - (m + ln(sum)) = exp(s - m) / exp(ln(sum)) = exp(s - m) / sum 
@@ -283,7 +288,7 @@ def flash_attn_backward_kernel(
         #                   = -sum(P, dim=-1) * P
 
         # dS - (BLOCK_SIZE_Q, BLOCK_SIZE_KV)
-        dS = P * (dP - tl.sum(dP * P, axis=1, keep_dims=True)) / d_k
+        dS = P * (dP - D) / d_k
         dK += tl.dot(tl.trans(dS), Q)
         dQ = tl.dot(dS, K) # (BLOCK_SIZE_Q, DIM)
         
@@ -308,6 +313,7 @@ def flash_attn_backward(
         Q, 
         K, 
         V, 
+        O,
         grad_upstream, 
         L, 
         device: torch.device
@@ -317,17 +323,19 @@ def flash_attn_backward(
         Q.device == 
         K.device == 
         V.device == 
+        O.device == 
         grad_upstream.device == 
         L.device == device
     ), 'Q, K, V must be the same device'
     assert K.shape == V.shape, 'K, V must be the same shape'
-    assert Q.shape == grad_upstream.shape, 'Q, grad_upstream must have the same shape'
+    assert Q.shape == grad_upstream.shape == O.shape, 'Q, grad_upstream, O must have the same shape'
     assert Q.shape[-1] == K.shape[-1], 'Q, K, V, grad_upstream must have the same feature dim'
     assert len(Q.shape) == len(K.shape), 'Q, K, V must have the same number of dims'
     assert len(L.shape) == 1, 'L must be 1 dimensional'
     assert Q.shape[-2] == L.shape[0]
 
     grad_Q, grad_K, grad_V = torch.zeros_like(Q, device=device), torch.empty_like(K, device=device), torch.empty_like(V, device=device)
+    D = (grad_upstream * O).sum(dim=-1)
     N_Q, N_KV = Q.shape[-2], K.shape[-2]
 
     grid = lambda meta: (triton.cdiv(N_KV, meta['BLOCK_SIZE_KV']), )
@@ -337,6 +345,7 @@ def flash_attn_backward(
         K,
         V,
         grad_upstream,
+        D,
         L,
         grad_Q,
         grad_K,
@@ -355,6 +364,7 @@ def flash_attn_backward(
         grad_K.stride(-1),
         grad_V.stride(-2),
         grad_V.stride(-1),
+        D.stride(-1),
         L.stride(-1),
         N_Q=N_Q,
         N_KV=N_KV,

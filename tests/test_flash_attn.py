@@ -90,8 +90,8 @@ def test_backward_matches_reference(N_Q, N_KV, DIM):
     torch.manual_seed(42)
     dO = torch.randn(N_Q, DIM, device=DEVICE)
 
-    _, L = flash_attn_forward(Q, K, V, DEVICE)
-    dQ, dK, dV = flash_attn_backward(Q, K, V, dO, L, DEVICE)
+    O, L = flash_attn_forward(Q, K, V, DEVICE)
+    dQ, dK, dV = flash_attn_backward(Q, K, V, O, dO, L, DEVICE)
 
     ref_dQ, ref_dK, ref_dV = _ref_grads(Q, K, V, dO)
 
@@ -103,8 +103,8 @@ def test_backward_matches_reference(N_Q, N_KV, DIM):
 def test_backward_output_shapes():
     Q, K, V = _qkv(128, 128, 64)
     dO = torch.randn_like(Q)
-    _, L = flash_attn_forward(Q, K, V, DEVICE)
-    dQ, dK, dV = flash_attn_backward(Q, K, V, dO, L, DEVICE)
+    O, L = flash_attn_forward(Q, K, V, DEVICE)
+    dQ, dK, dV = flash_attn_backward(Q, K, V, O, dO, L, DEVICE)
     assert dQ.shape == Q.shape
     assert dK.shape == K.shape
     assert dV.shape == V.shape
