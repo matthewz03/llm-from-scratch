@@ -15,6 +15,23 @@ WARP_SIZE = properties["warpSize"]
 target = triton.runtime.driver.active.get_current_target()
 kernels = {}
 
+def get_cuda_configs():
+    return [
+        triton.Config(
+            {
+                'BLOCK_SIZE_Q': 2**q,
+                'BLOCK_SIZE_KV': 2**k,
+                'num_stages': s
+            },
+            num_warps=2**w,
+        )
+        for q in range(4, 6)
+            for k in range(4, 6)
+                for w in range(1, 4)
+                    for s in range(2, 5)
+    ]
+
+@triton.autotune(configs=get_cuda_configs(), key=['N_Q', 'N_KV', 'DIM'])
 @triton.jit
 def flash_attn_forward_kernel(
         q_ptr, 
@@ -115,7 +132,6 @@ def flash_attn_forward(
     DIM = Q.shape[-1]
     L = torch.empty(N_Q, dtype=Q.dtype, device=device)
 
-    num_stages = 4 if SIZE_SMEM > 200000 else 2
     grid = lambda meta: (triton.cdiv(N_Q, meta['BLOCK_SIZE_Q']), )
 
     flash_attn_forward_kernel[grid](
@@ -136,13 +152,11 @@ def flash_attn_forward(
         N_Q=N_Q,
         N_KV=N_KV,
         DIM=DIM,
-        num_stages=num_stages,
-        BLOCK_SIZE_Q=64,
-        BLOCK_SIZE_KV=64,
     )
 
     return O, L
 
+@triton.autotune(configs=get_cuda_configs(), key=['N_Q', 'N_KV', 'DIM'])
 @triton.jit
 def flash_attn_backward_kernel(
         q_ptr, 
@@ -168,7 +182,6 @@ def flash_attn_backward_kernel(
         dk_col_stride,
         dv_row_stride,
         dv_col_stride,
-        # m_stride, 
         l_stride, # l.shape is (N_Q,)
         N_Q,
         N_KV,
@@ -317,7 +330,6 @@ def flash_attn_backward(
     grad_Q, grad_K, grad_V = torch.zeros_like(Q, device=device), torch.empty_like(K, device=device), torch.empty_like(V, device=device)
     N_Q, N_KV = Q.shape[-2], K.shape[-2]
 
-    num_stages = 4 if SIZE_SMEM > 200000 else 2
     grid = lambda meta: (triton.cdiv(N_KV, meta['BLOCK_SIZE_KV']), )
 
     flash_attn_backward_kernel[grid](
@@ -347,9 +359,6 @@ def flash_attn_backward(
         N_Q=N_Q,
         N_KV=N_KV,
         DIM=Q.shape[-1],
-        num_stages=num_stages,
-        BLOCK_SIZE_Q=64,
-        BLOCK_SIZE_KV=64,
     )
 
     return grad_Q, grad_K, grad_V
