@@ -39,14 +39,24 @@ def flash_attn_forward_kernel(
         v_ptr,
         o_ptr,
         l_ptr,
+        q_batch_stride,
+        q_head_stride,
         q_row_stride,
         q_col_stride,
+        k_batch_stride,
+        k_head_stride,
         k_row_stride,
         k_col_stride,
+        v_batch_stride,
+        v_head_stride,
         v_row_stride,
         v_col_stride,
+        o_batch_stride,
+        o_head_stride,
         o_row_stride,
         o_col_stride,
+        l_batch_stride,
+        l_head_stride,
         l_stride,
         N_Q,
         N_KV,
@@ -57,6 +67,14 @@ def flash_attn_forward_kernel(
     ):
 
     pid = tl.program_id(axis=0)
+    head_id = tl.program_id(axis=1)
+    batch_id = tl.program_id(axis=2)
+
+    q_ptr += batch_id * q_batch_stride + head_id * q_head_stride
+    k_ptr += batch_id * k_batch_stride + head_id * k_head_stride
+    v_ptr += batch_id * v_batch_stride + head_id * v_head_stride
+    o_ptr += batch_id * o_batch_stride + head_id * o_head_stride
+    l_ptr += batch_id * l_batch_stride + head_id * l_head_stride
 
     qo_row_idx = pid * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
     qo_col_idx = tl.arange(0, DIM)
@@ -124,15 +142,16 @@ def flash_attn_forward(
     assert Q.device == K.device == V.device == device, 'Q, K, V must be the same device'
     assert K.shape == V.shape, 'K, V must be the same shape'
     assert Q.shape[-1] == K.shape[-1], 'Q, K, V must have the same feature dim'
+    assert Q.shape[:2] == K.shape[:2], 'Q, K, V must have the same batch, and head size'
     assert len(Q.shape) == len(K.shape)
 
     O = torch.empty_like(Q, dtype=Q.dtype, device=device)
-    N_Q = Q.shape[-2]
+    BATCH, HEADS, N_Q, DIM = Q.shape
     N_KV = K.shape[-2]
-    DIM = Q.shape[-1]
-    L = torch.empty(N_Q, dtype=Q.dtype, device=device)
+    # DIM = Q.shape[-1]
+    L = torch.empty((BATCH, HEADS, N_Q), dtype=Q.dtype, device=device)
 
-    grid = lambda meta: (triton.cdiv(N_Q, meta['BLOCK_SIZE_Q']), )
+    grid = lambda meta: (triton.cdiv(N_Q, meta['BLOCK_SIZE_Q']), HEADS, BATCH)
 
     flash_attn_forward_kernel[grid](
         Q, 
@@ -140,15 +159,25 @@ def flash_attn_forward(
         V, 
         O,
         L,
-        Q.stride(-2),
-        Q.stride(-1),
-        K.stride(-2),
-        K.stride(-1),
-        V.stride(-2),
-        V.stride(-1),
-        O.stride(-2),
-        O.stride(-1),
-        L.stride(-1),
+        Q.stride(0),
+        Q.stride(1),
+        Q.stride(2),
+        Q.stride(3),
+        K.stride(0),
+        K.stride(1),
+        K.stride(2),
+        K.stride(3),
+        V.stride(0),
+        V.stride(1),
+        V.stride(2),
+        V.stride(3),
+        O.stride(0),
+        O.stride(1),
+        O.stride(2),
+        O.stride(3),
+        L.stride(0),
+        L.stride(1),
+        L.stride(2),
         N_Q=N_Q,
         N_KV=N_KV,
         DIM=DIM,
@@ -162,27 +191,45 @@ def flash_attn_backward_kernel(
         q_ptr, 
         k_ptr, 
         v_ptr,
-        do_ptr,
         d_ptr,
         l_ptr,
+        do_ptr,
         dq_ptr,
         dk_ptr,
         dv_ptr,
+        q_batch_stride,
+        q_head_stride,
         q_row_stride,
         q_col_stride,
+        k_batch_stride,
+        k_head_stride,
         k_row_stride,
         k_col_stride,
+        v_batch_stride,
+        v_head_stride,
         v_row_stride,
         v_col_stride,
+        do_batch_stride,
+        do_head_stride,
         do_row_stride,
         do_col_stride,
+        dq_batch_stride,
+        dq_head_stride,
         dq_row_stride,
         dq_col_stride,
+        dk_batch_stride,
+        dk_head_stride,
         dk_row_stride,
         dk_col_stride,
+        dv_batch_stride,
+        dv_head_stride,
         dv_row_stride,
         dv_col_stride,
+        d_batch_stride,
+        d_head_stride,
         d_stride,
+        l_batch_stride,
+        l_head_stride,
         l_stride, # l.shape is (N_Q,)
         N_Q,
         N_KV,
@@ -221,6 +268,18 @@ def flash_attn_backward_kernel(
     '''
 
     pid = tl.program_id(axis=0)
+    head_id = tl.program_id(axis=1)
+    batch_id = tl.program_id(axis=2)
+
+    q_ptr  += batch_id * q_batch_stride  + head_id * q_head_stride
+    k_ptr  += batch_id * k_batch_stride  + head_id * k_head_stride
+    v_ptr  += batch_id * v_batch_stride  + head_id * v_head_stride
+    do_ptr += batch_id * do_batch_stride + head_id * do_head_stride
+    dq_ptr += batch_id * dq_batch_stride + head_id * dq_head_stride
+    dk_ptr += batch_id * dk_batch_stride + head_id * dk_head_stride
+    dv_ptr += batch_id * dv_batch_stride + head_id * dv_head_stride
+    d_ptr  += batch_id * d_batch_stride  + head_id * d_head_stride
+    l_ptr  += batch_id * l_batch_stride  + head_id * l_head_stride
 
     kv_row_idx = pid * BLOCK_SIZE_KV + tl.arange(0, BLOCK_SIZE_KV)
     kv_col_idx = tl.arange(0, DIM)
@@ -331,44 +390,63 @@ def flash_attn_backward(
     assert Q.shape == grad_upstream.shape == O.shape, 'Q, grad_upstream, O must have the same shape'
     assert Q.shape[-1] == K.shape[-1], 'Q, K, V, grad_upstream must have the same feature dim'
     assert len(Q.shape) == len(K.shape), 'Q, K, V must have the same number of dims'
-    assert len(L.shape) == 1, 'L must be 1 dimensional'
-    assert Q.shape[-2] == L.shape[0]
+    assert len(L.shape) == len(Q.shape) - 1, 'L must be 1 dimensional'
+    assert Q.shape[-2] == L.shape[-1], 'L must have the same number of rows as Q'
 
     grad_Q, grad_K, grad_V = torch.zeros_like(Q, device=device), torch.empty_like(K, device=device), torch.empty_like(V, device=device)
     D = (grad_upstream * O).sum(dim=-1)
-    N_Q, N_KV = Q.shape[-2], K.shape[-2]
+    BATCH, HEADS, N_Q, DIM = Q.shape
+    N_KV = K.shape[-2]
 
-    grid = lambda meta: (triton.cdiv(N_KV, meta['BLOCK_SIZE_KV']), )
+    grid = lambda meta: (triton.cdiv(N_KV, meta['BLOCK_SIZE_KV']), HEADS, BATCH)
 
     flash_attn_backward_kernel[grid](
         Q,
         K,
         V,
-        grad_upstream,
         D,
         L,
+        grad_upstream,
         grad_Q,
         grad_K,
         grad_V,
-        Q.stride(-2),
-        Q.stride(-1),
-        K.stride(-2),
-        K.stride(-1),
-        V.stride(-2),
-        V.stride(-1),
-        grad_upstream.stride(-2),
-        grad_upstream.stride(-1),
-        grad_Q.stride(-2),
-        grad_Q.stride(-1),
-        grad_K.stride(-2),
-        grad_K.stride(-1),
-        grad_V.stride(-2),
-        grad_V.stride(-1),
-        D.stride(-1),
-        L.stride(-1),
+        Q.stride(0),
+        Q.stride(1),
+        Q.stride(2),
+        Q.stride(3),
+        K.stride(0),
+        K.stride(1),
+        K.stride(2),
+        K.stride(3),
+        V.stride(0),
+        V.stride(1),
+        V.stride(2),
+        V.stride(3),
+        grad_upstream.stride(0),
+        grad_upstream.stride(1),
+        grad_upstream.stride(2),
+        grad_upstream.stride(3),
+        grad_Q.stride(0),
+        grad_Q.stride(1),
+        grad_Q.stride(2),
+        grad_Q.stride(3),
+        grad_K.stride(0),
+        grad_K.stride(1),
+        grad_K.stride(2),
+        grad_K.stride(3),
+        grad_V.stride(0),
+        grad_V.stride(1),
+        grad_V.stride(2),
+        grad_V.stride(3),
+        D.stride(0),
+        D.stride(1),
+        D.stride(2),
+        L.stride(0),
+        L.stride(1),
+        L.stride(2),
         N_Q=N_Q,
         N_KV=N_KV,
-        DIM=Q.shape[-1],
+        DIM=DIM,
     )
 
     return grad_Q, grad_K, grad_V

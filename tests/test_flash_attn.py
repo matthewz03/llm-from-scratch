@@ -9,10 +9,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from modules.kernels.FlashAttention import flash_attn_forward, flash_attn_backward
 
 DEVICE = torch.device("cuda:0")
+BATCH = 2
+HEADS = 4
 
 
 def _ref(Q, K, V):
-    S = Q @ K.T / math.sqrt(Q.shape[-1])
+    S = Q @ K.transpose(-1, -2) / math.sqrt(Q.shape[-1])
     return F.softmax(S, dim=-1) @ V
 
 
@@ -24,9 +26,9 @@ def require_cuda():
 
 def _qkv(N_Q, N_KV, DIM, seed=0):
     torch.manual_seed(seed)
-    Q = torch.randn(N_Q, DIM, device=DEVICE)
-    K = torch.randn(N_KV, DIM, device=DEVICE)
-    V = torch.randn(N_KV, DIM, device=DEVICE)
+    Q = torch.randn(BATCH, HEADS, N_Q, DIM, device=DEVICE)
+    K = torch.randn(BATCH, HEADS, N_KV, DIM, device=DEVICE)
+    V = torch.randn(BATCH, HEADS, N_KV, DIM, device=DEVICE)
     return Q, K, V
 
 
@@ -46,7 +48,7 @@ def test_forward_matches_reference(N_Q, N_KV, DIM):
 
 
 def test_forward_padded_sequence():
-    # N not a multiple of BLOCK_SIZE_Q=64 — exercises the tail-block mask
+    # N not a multiple of BLOCK_SIZE_Q — exercises the tail-block mask
     Q, K, V = _qkv(N_Q=100, N_KV=100, DIM=64)
     ref = _ref(Q, K, V)
     out, _ = flash_attn_forward(Q, K, V, Q.device)
@@ -57,7 +59,7 @@ def test_forward_output_shape():
     Q, K, V = _qkv(128, 128, 64)
     out, L = flash_attn_forward(Q, K, V, Q.device)
     assert out.shape == Q.shape
-    assert L.shape == (Q.shape[0],)
+    assert L.shape == (BATCH, HEADS, Q.shape[-2])
 
 
 def test_forward_different_seeds():
@@ -70,11 +72,10 @@ def test_forward_different_seeds():
 # ── backward ──────────────────────────────────────────────────────────────────
 
 def _ref_grads(Q, K, V, dO):
-    """Reference gradients via PyTorch autograd."""
     Q_r = Q.clone().requires_grad_(True)
     K_r = K.clone().requires_grad_(True)
     V_r = V.clone().requires_grad_(True)
-    S = Q_r @ K_r.T / math.sqrt(Q.shape[-1])
+    S = Q_r @ K_r.transpose(-1, -2) / math.sqrt(Q.shape[-1])
     O = F.softmax(S, dim=-1) @ V_r
     O.backward(dO)
     return Q_r.grad, K_r.grad, V_r.grad
@@ -88,7 +89,7 @@ def _ref_grads(Q, K, V, dO):
 def test_backward_matches_reference(N_Q, N_KV, DIM):
     Q, K, V = _qkv(N_Q, N_KV, DIM)
     torch.manual_seed(42)
-    dO = torch.randn(N_Q, DIM, device=DEVICE)
+    dO = torch.randn(BATCH, HEADS, N_Q, DIM, device=DEVICE)
 
     O, L = flash_attn_forward(Q, K, V, DEVICE)
     dQ, dK, dV = flash_attn_backward(Q, K, V, O, dO, L, DEVICE)
