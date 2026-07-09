@@ -60,6 +60,7 @@ def flash_attn_forward_kernel(
         l_stride,
         N_Q,
         N_KV,
+        is_causal: tl.constexpr,
         DIM: tl.constexpr,
         num_stages: tl.constexpr,
         BLOCK_SIZE_Q: tl.constexpr,
@@ -91,7 +92,10 @@ def flash_attn_forward_kernel(
 
     d_k = DIM ** (0.5)
 
-    for i in tl.range(0, N_KV, BLOCK_SIZE_KV, num_stages=num_stages):
+    kv_end = tl.minimum((pid + 1) * BLOCK_SIZE_Q, N_KV) if is_causal else N_KV
+
+    for i in tl.range(0, kv_end, BLOCK_SIZE_KV, num_stages=num_stages):
+
         kv_row_idx = i + tl.arange(0, BLOCK_SIZE_KV)
         kv_col_idx = tl.arange(0, DIM)
         kv_mask = (kv_row_idx < N_KV)[:, None] & (kv_col_idx < DIM)[None, :]
@@ -107,8 +111,10 @@ def flash_attn_forward_kernel(
         V = tl.load(v_ptr + v_offsets, mask=kv_mask, other=0.0)
 
         S = tl.dot(Q, tl.trans(K)) / d_k
-        bound_mask = (kv_row_idx < N_KV)
-        S = tl.where(bound_mask[None, :], S, float('-inf'))
+        bound_mask = (qo_row_idx < N_Q)[:, None] & (kv_row_idx < N_KV)[None, :]
+        if is_causal:
+            bound_mask &= qo_row_idx[:, None] >= kv_row_idx
+        S = tl.where(bound_mask, S, float('-inf'))
 
         curr_m = tl.max(S, axis=1, keep_dims=True)
         new_m = tl.maximum(m, curr_m)
@@ -136,6 +142,7 @@ def flash_attn_forward(
         Q: torch.Tensor, 
         K: torch.Tensor, 
         V: torch.Tensor,
+        is_causal: bool,
         device: torch.device
     ):
     
@@ -154,33 +161,16 @@ def flash_attn_forward(
     grid = lambda meta: (triton.cdiv(N_Q, meta['BLOCK_SIZE_Q']), HEADS, BATCH)
 
     flash_attn_forward_kernel[grid](
-        Q, 
-        K, 
-        V, 
-        O,
-        L,
-        Q.stride(0),
-        Q.stride(1),
-        Q.stride(2),
-        Q.stride(3),
-        K.stride(0),
-        K.stride(1),
-        K.stride(2),
-        K.stride(3),
-        V.stride(0),
-        V.stride(1),
-        V.stride(2),
-        V.stride(3),
-        O.stride(0),
-        O.stride(1),
-        O.stride(2),
-        O.stride(3),
-        L.stride(0),
-        L.stride(1),
-        L.stride(2),
+        Q, K, V, O, L,
+        *Q.stride(),
+        *K.stride(),
+        *V.stride(),
+        *O.stride(),
+        *L.stride(),
         N_Q=N_Q,
         N_KV=N_KV,
         DIM=DIM,
+        is_causal=is_causal
     )
 
     return O, L
@@ -234,6 +224,7 @@ def flash_attn_backward_kernel(
         N_Q,
         N_KV,
         DIM: tl.constexpr,
+        is_causal: tl.constexpr,
         num_stages: tl.constexpr,
         BLOCK_SIZE_Q: tl.constexpr,
         BLOCK_SIZE_KV: tl.constexpr
@@ -300,8 +291,9 @@ def flash_attn_backward_kernel(
     dK = tl.zeros_like(K)
     
     d_k = DIM ** (0.5)
+    q_start = pid * BLOCK_SIZE_KV if is_causal else 0
 
-    for i in tl.range(0, N_Q, BLOCK_SIZE_Q, num_stages=num_stages):
+    for i in tl.range(q_start, N_Q, BLOCK_SIZE_Q, num_stages=num_stages):
 
         qo_row_idx = i + tl.arange(0, BLOCK_SIZE_Q)
         qo_col_idx = tl.arange(0, DIM)
@@ -333,6 +325,11 @@ def flash_attn_backward_kernel(
         # L = m + ln(sum)
         # exp(s - L) = exp(s - (m + ln(sum)) = exp(s - m) / exp(ln(sum)) = exp(s - m) / sum 
         S = tl.dot(Q, tl.trans(K)) / d_k
+
+        bound_mask = (qo_row_idx < N_Q)[:, None] & (kv_row_idx < N_KV)[None, :]
+        if is_causal:
+            bound_mask &= qo_row_idx[:, None] >= kv_row_idx
+        S = tl.where(bound_mask, S, float('-inf'))
         P = tl.exp(S - L)
 
         dV += tl.dot(tl.trans(P), dO) # (BLOCK_SIZE_KV, BLOCK_SIZE_Q) X (BLOCK_SIZE_Q, DIM)
@@ -369,12 +366,13 @@ def flash_attn_backward_kernel(
     tl.store(dv_ptr + dv_offsets, dV, mask=kv_mask)
 
 def flash_attn_backward(
-        Q, 
-        K, 
-        V, 
-        O,
-        grad_upstream, 
-        L, 
+        Q: torch.Tensor, 
+        K: torch.Tensor, 
+        V: torch.Tensor, 
+        O: torch.Tensor,
+        grad_upstream: torch.Tensor, 
+        L: torch.Tensor, 
+        is_causal: bool,
         device: torch.device
     ):
 
@@ -401,52 +399,20 @@ def flash_attn_backward(
     grid = lambda meta: (triton.cdiv(N_KV, meta['BLOCK_SIZE_KV']), HEADS, BATCH)
 
     flash_attn_backward_kernel[grid](
-        Q,
-        K,
-        V,
-        D,
-        L,
-        grad_upstream,
-        grad_Q,
-        grad_K,
-        grad_V,
-        Q.stride(0),
-        Q.stride(1),
-        Q.stride(2),
-        Q.stride(3),
-        K.stride(0),
-        K.stride(1),
-        K.stride(2),
-        K.stride(3),
-        V.stride(0),
-        V.stride(1),
-        V.stride(2),
-        V.stride(3),
-        grad_upstream.stride(0),
-        grad_upstream.stride(1),
-        grad_upstream.stride(2),
-        grad_upstream.stride(3),
-        grad_Q.stride(0),
-        grad_Q.stride(1),
-        grad_Q.stride(2),
-        grad_Q.stride(3),
-        grad_K.stride(0),
-        grad_K.stride(1),
-        grad_K.stride(2),
-        grad_K.stride(3),
-        grad_V.stride(0),
-        grad_V.stride(1),
-        grad_V.stride(2),
-        grad_V.stride(3),
-        D.stride(0),
-        D.stride(1),
-        D.stride(2),
-        L.stride(0),
-        L.stride(1),
-        L.stride(2),
+        Q, K, V, D, L, grad_upstream, grad_Q, grad_K, grad_V,
+        *Q.stride(),
+        *K.stride(),
+        *V.stride(),
+        *grad_upstream.stride(),
+        *grad_Q.stride(),
+        *grad_K.stride(),
+        *grad_V.stride(),
+        *D.stride(),
+        *L.stride(),
         N_Q=N_Q,
         N_KV=N_KV,
         DIM=DIM,
+        is_causal=is_causal
     )
 
     return grad_Q, grad_K, grad_V

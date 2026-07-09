@@ -72,7 +72,6 @@ class MultiheadAttentionFunction(torch.autograd.Function):
         attn_map = torch.softmax(A / math.sqrt(K.shape[-1]), dim=-1)
         attn_output = _from_multihead(attn_map @ V, emb_dim)
 
-        # CORE CHANGE: save Q, K, V directly — no recomputation needed in backward
         ctx.save_for_backward(Q, K, V, attn_map)
 
         return attn_output
