@@ -370,8 +370,8 @@ def flash_attn_backward(
         K: torch.Tensor, 
         V: torch.Tensor, 
         O: torch.Tensor,
-        grad_upstream: torch.Tensor, 
         L: torch.Tensor, 
+        grad_upstream: torch.Tensor, 
         is_causal: bool,
         device: torch.device
     ):

@@ -1,5 +1,6 @@
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import pytest
 import torch
 import torch.nn as nn
 from modules.MultiheadAttention import MultiheadAttention, MultiheadAttentionFunction
@@ -8,6 +9,14 @@ EMB = 8
 HEADS = 2
 BATCH = 4
 SEQ = 6
+
+# Larger dims needed for flash attn kernel (BLOCK_SIZE >= 16, tl.dot needs power-of-2 dims)
+FLASH_EMB = 64
+FLASH_HEADS = 4
+FLASH_BATCH = 2
+FLASH_SEQ = 64
+
+DEVICE = torch.device("cuda:0")
 
 
 def make_ref(our_layer, embed_dim, num_heads):
@@ -31,17 +40,23 @@ def make_ref(our_layer, embed_dim, num_heads):
     return ref
 
 
+@pytest.fixture
+def require_cuda():
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+
+
 # ---------------------------------------------------------------------------
 # Forward — output shape
 # ---------------------------------------------------------------------------
 
 def test_output_shape_self_attn():
-    layer = MultiheadAttention(EMB, HEADS)
+    layer = MultiheadAttention(EMB, HEADS, flash_attn=False)
     x = torch.randn(BATCH, SEQ, EMB)
     assert layer(x, x, x).shape == (BATCH, SEQ, EMB)
 
 def test_output_shape_cross_attn():
-    layer = MultiheadAttention(EMB, HEADS)
+    layer = MultiheadAttention(EMB, HEADS, flash_attn=False)
     q = torch.randn(BATCH, SEQ, EMB)
     k = torch.randn(BATCH, SEQ + 2, EMB)
     v = torch.randn(BATCH, SEQ + 2, EMB)
@@ -52,7 +67,7 @@ def test_output_shape_cross_attn():
 # ---------------------------------------------------------------------------
 
 def _forward_match(bias, add_bias_kv):
-    layer = MultiheadAttention(EMB, HEADS, bias=bias, add_bias_kv=add_bias_kv)
+    layer = MultiheadAttention(EMB, HEADS, bias=bias, add_bias_kv=add_bias_kv, flash_attn=False)
     ref = make_ref(layer, EMB, HEADS)
     x = torch.randn(BATCH, SEQ, EMB)
     our_out = layer(x, x, x)
@@ -74,7 +89,7 @@ def test_forward_full_bias():
 # ---------------------------------------------------------------------------
 
 def test_causal_mask_changes_output():
-    layer = MultiheadAttention(EMB, HEADS, bias=False)
+    layer = MultiheadAttention(EMB, HEADS, bias=False, flash_attn=False)
     x = torch.randn(BATCH, SEQ, EMB)
     out_causal = layer(x, x, x, is_causal=True)
     out_normal = layer(x, x, x, is_causal=False)
@@ -82,11 +97,7 @@ def test_causal_mask_changes_output():
         "causal mask should change output"
 
 def test_causal_mask_last_token_differs():
-    # The last token attends to all previous tokens with causal mask,
-    # so its output must differ from non-causal (which also attends to future, but there are none —
-    # actually the last token IS the last, so the real difference is in earlier tokens).
-    # Simplest check: the second token differs (attends to [0,1] vs [0..SEQ-1])
-    layer = MultiheadAttention(EMB, HEADS, bias=False)
+    layer = MultiheadAttention(EMB, HEADS, bias=False, flash_attn=False)
     x = torch.randn(BATCH, SEQ, EMB)
     out_causal = layer(x, x, x, is_causal=True)
     out_normal = layer(x, x, x, is_causal=False)
@@ -98,16 +109,16 @@ def test_causal_mask_last_token_differs():
 # ---------------------------------------------------------------------------
 
 def test_key_padding_mask_changes_output():
-    layer = MultiheadAttention(EMB, HEADS, bias=False)
+    layer = MultiheadAttention(EMB, HEADS, bias=False, flash_attn=False)
     x = torch.randn(BATCH, SEQ, EMB)
     mask = torch.zeros(BATCH, SEQ, dtype=torch.bool)
-    mask[:, -1] = True  # mask out last token as padding
+    mask[:, -1] = True
     out_masked = layer(x, x, x, key_padding_mask=mask)
     out_normal = layer(x, x, x)
     assert not torch.allclose(out_masked, out_normal)
 
 def test_key_padding_mask_wrong_shape_raises():
-    layer = MultiheadAttention(EMB, HEADS)
+    layer = MultiheadAttention(EMB, HEADS, flash_attn=False)
     x = torch.randn(BATCH, SEQ, EMB)
     bad_mask = torch.zeros(BATCH, SEQ + 1, dtype=torch.bool)
     try:
@@ -121,7 +132,7 @@ def test_key_padding_mask_wrong_shape_raises():
 # ---------------------------------------------------------------------------
 
 def _grad_match(bias, add_bias_kv):
-    layer = MultiheadAttention(EMB, HEADS, bias=bias, add_bias_kv=add_bias_kv)
+    layer = MultiheadAttention(EMB, HEADS, bias=bias, add_bias_kv=add_bias_kv, flash_attn=False)
     ref = make_ref(layer, EMB, HEADS)
 
     x1 = torch.randn(BATCH, SEQ, EMB, requires_grad=True)
@@ -148,22 +159,20 @@ def test_grad_full_bias():
 # ---------------------------------------------------------------------------
 
 def test_gradcheck_no_bias():
-    # Function now takes Q, K, V in multihead format — projections live in the Module
     E, H = 4, 2
     head_dim = E // H
     Q = torch.randn(2, H, 3, head_dim, dtype=torch.float64, requires_grad=True)
     K = torch.randn(2, H, 3, head_dim, dtype=torch.float64, requires_grad=True)
     V = torch.randn(2, H, 3, head_dim, dtype=torch.float64, requires_grad=True)
     result = torch.autograd.gradcheck(
-        lambda Q, K, V: MultiheadAttentionFunction.apply(Q, K, V, E, H),
+        lambda Q, K, V: MultiheadAttentionFunction.apply(Q, K, V, E, H, None, None, False, False),
         (Q, K, V), eps=1e-6, atol=1e-4
     )
     assert result
 
 def test_gradcheck_with_bias():
-    # End-to-end gradcheck through the Module covers W_q/W_k/W_v/W_o gradients
     E, H = 4, 2
-    layer = MultiheadAttention(E, H, bias=True, add_bias_kv=True).double()
+    layer = MultiheadAttention(E, H, bias=True, add_bias_kv=True, flash_attn=False).double()
     q = torch.randn(2, 3, E, dtype=torch.float64, requires_grad=True)
     k = torch.randn(2, 3, E, dtype=torch.float64, requires_grad=True)
     v = torch.randn(2, 3, E, dtype=torch.float64, requires_grad=True)
@@ -179,17 +188,14 @@ def test_gradcheck_with_bias():
 
 def test_parameters_bias_no_kv():
     layer = MultiheadAttention(EMB, HEADS, bias=True, add_bias_kv=False)
-    # W_q, W_k, W_v, W_o, b_q, b_o = 6
     assert len(list(layer.parameters())) == 6
 
 def test_parameters_full_bias():
     layer = MultiheadAttention(EMB, HEADS, bias=True, add_bias_kv=True)
-    # W_q, W_k, W_v, W_o, b_q, b_o, b_k, b_v = 8
     assert len(list(layer.parameters())) == 8
 
 def test_parameters_no_bias():
     layer = MultiheadAttention(EMB, HEADS, bias=False, add_bias_kv=False)
-    # W_q, W_k, W_v, W_o = 4
     assert len(list(layer.parameters())) == 4
 
 def test_head_count_assertion():
@@ -204,9 +210,8 @@ def test_head_count_assertion():
 # ---------------------------------------------------------------------------
 
 def _make_rope_pair(bias=False):
-    """Return (layer_rope, layer_norope) with identical projection weights."""
-    layer_rope   = MultiheadAttention(EMB, HEADS, rope_seq_len=SEQ * 2, bias=bias)
-    layer_norope = MultiheadAttention(EMB, HEADS, bias=bias)
+    layer_rope   = MultiheadAttention(EMB, HEADS, rope_seq_len=SEQ * 2, bias=bias, flash_attn=False)
+    layer_norope = MultiheadAttention(EMB, HEADS, bias=bias, flash_attn=False)
     with torch.no_grad():
         layer_norope.proj_q.weight.copy_(layer_rope.proj_q.weight)
         layer_norope.proj_k.weight.copy_(layer_rope.proj_k.weight)
@@ -216,15 +221,13 @@ def _make_rope_pair(bias=False):
 
 
 def test_rope_output_shape_self_attn():
-    layer = MultiheadAttention(EMB, HEADS, rope_seq_len=SEQ)
+    layer = MultiheadAttention(EMB, HEADS, rope_seq_len=SEQ, flash_attn=False)
     x = torch.randn(BATCH, SEQ, EMB)
     assert layer(x, x, x).shape == (BATCH, SEQ, EMB)
 
 
 def test_rope_output_shape_cross_attn():
-    # Regression: RoPE must slice cos/sin separately for Q and K
-    # so that different query and key sequence lengths don't cause a shape mismatch.
-    layer = MultiheadAttention(EMB, HEADS, rope_seq_len=SEQ + 2)
+    layer = MultiheadAttention(EMB, HEADS, rope_seq_len=SEQ + 2, flash_attn=False)
     q = torch.randn(BATCH, SEQ, EMB)
     k = torch.randn(BATCH, SEQ + 2, EMB)
     v = torch.randn(BATCH, SEQ + 2, EMB)
@@ -232,20 +235,15 @@ def test_rope_output_shape_cross_attn():
 
 
 def test_rope_changes_output():
-    # Identical projection weights but with vs without RoPE should give different outputs.
     layer_rope, layer_norope = _make_rope_pair()
     x = torch.randn(BATCH, SEQ, EMB)
     assert not torch.allclose(layer_rope(x, x, x), layer_norope(x, x, x))
 
 
 def test_rope_position_sensitivity():
-    # Core RoPE property: the same embedding at two different positions should
-    # produce different outputs (rotations differ by position).
-    # Contrast: without RoPE, identical embeddings at positions 0 and 1 give
-    # identical outputs because Q[0]==Q[1] and they attend the same K,V.
     layer_rope, layer_norope = _make_rope_pair()
     x = torch.randn(1, SEQ, EMB)
-    x[0, 1] = x[0, 0].clone()   # force token 0 and token 1 to be identical
+    x[0, 1] = x[0, 0].clone()
 
     out_rope   = layer_rope(x, x, x)
     out_norope = layer_norope(x, x, x)
@@ -257,14 +255,13 @@ def test_rope_position_sensitivity():
 
 
 def test_rope_no_extra_parameters():
-    # cos/sin are buffers not Parameters — parameter count should be identical.
     layer_rope   = MultiheadAttention(EMB, HEADS, rope_seq_len=SEQ, bias=False)
     layer_norope = MultiheadAttention(EMB, HEADS, bias=False)
     assert len(list(layer_rope.parameters())) == len(list(layer_norope.parameters()))
 
 
 def test_rope_backward_gradients_exist():
-    layer = MultiheadAttention(EMB, HEADS, rope_seq_len=SEQ, bias=False)
+    layer = MultiheadAttention(EMB, HEADS, rope_seq_len=SEQ, bias=False, flash_attn=False)
     x = torch.randn(BATCH, SEQ, EMB, requires_grad=True)
     layer(x, x, x).sum().backward()
     assert x.grad is not None
@@ -274,12 +271,70 @@ def test_rope_backward_gradients_exist():
 
 def test_rope_gradcheck():
     E, H = 4, 2
-    layer = MultiheadAttention(E, H, rope_seq_len=8, bias=False).double()
+    layer = MultiheadAttention(E, H, rope_seq_len=8, bias=False, flash_attn=False).double()
     q = torch.randn(2, 3, E, dtype=torch.float64, requires_grad=True)
     assert torch.autograd.gradcheck(
         lambda q: layer(q, q, q),
         (q,), eps=1e-6, atol=1e-4,
     )
+
+
+# ---------------------------------------------------------------------------
+# Flash attention integration
+# ---------------------------------------------------------------------------
+
+def _make_flash_pair(bias=False):
+    """Two layers with identical weights: one flash, one standard."""
+    flash  = MultiheadAttention(FLASH_EMB, FLASH_HEADS, bias=bias, flash_attn=True,  device=DEVICE)
+    std    = MultiheadAttention(FLASH_EMB, FLASH_HEADS, bias=bias, flash_attn=False, device=DEVICE)
+    with torch.no_grad():
+        std.proj_q.weight.copy_(flash.proj_q.weight)
+        std.proj_k.weight.copy_(flash.proj_k.weight)
+        std.proj_v.weight.copy_(flash.proj_v.weight)
+        std.proj_o.weight.copy_(flash.proj_o.weight)
+    return flash, std
+
+
+def test_flash_output_shape(require_cuda):
+    layer = MultiheadAttention(FLASH_EMB, FLASH_HEADS, flash_attn=True, device=DEVICE)
+    x = torch.randn(FLASH_BATCH, FLASH_SEQ, FLASH_EMB, device=DEVICE)
+    assert layer(x, x, x).shape == (FLASH_BATCH, FLASH_SEQ, FLASH_EMB)
+
+
+def test_flash_matches_standard(require_cuda):
+    flash, std = _make_flash_pair()
+    x = torch.randn(FLASH_BATCH, FLASH_SEQ, FLASH_EMB, device=DEVICE)
+    out_flash = flash(x, x, x)
+    out_std   = std(x, x, x)
+    assert torch.allclose(out_flash, out_std, atol=1e-2), \
+        f"flash vs standard max diff: {(out_flash - out_std).abs().max():.5f}"
+
+
+def test_flash_causal_matches_standard(require_cuda):
+    flash, std = _make_flash_pair()
+    x = torch.randn(FLASH_BATCH, FLASH_SEQ, FLASH_EMB, device=DEVICE)
+    out_flash = flash(x, x, x, is_causal=True)
+    out_std   = std(x, x, x, is_causal=True)
+    assert torch.allclose(out_flash, out_std, atol=1e-2), \
+        f"flash causal vs standard causal max diff: {(out_flash - out_std).abs().max():.5f}"
+
+
+def test_flash_backward_gradients_flow(require_cuda):
+    layer = MultiheadAttention(FLASH_EMB, FLASH_HEADS, flash_attn=True, device=DEVICE)
+    x = torch.randn(FLASH_BATCH, FLASH_SEQ, FLASH_EMB, device=DEVICE, requires_grad=True)
+    layer(x, x, x).sum().backward()
+    assert x.grad is not None
+    assert layer.proj_q.weight.grad is not None
+    assert layer.proj_o.weight.grad is not None
+
+
+def test_flash_causal_backward_gradients_flow(require_cuda):
+    layer = MultiheadAttention(FLASH_EMB, FLASH_HEADS, flash_attn=True, device=DEVICE)
+    x = torch.randn(FLASH_BATCH, FLASH_SEQ, FLASH_EMB, device=DEVICE, requires_grad=True)
+    layer(x, x, x, is_causal=True).sum().backward()
+    assert x.grad is not None
+    assert layer.proj_q.weight.grad is not None
+    assert layer.proj_o.weight.grad is not None
 
 
 if __name__ == "__main__":

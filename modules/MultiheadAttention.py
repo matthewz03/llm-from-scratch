@@ -4,6 +4,7 @@ from torch.autograd.function import FunctionCtx
 import math
 from .Linear import Linear
 from .RotaryPositionalEmbeddings import RotaryPositionEmbeddings
+from .kernels.FlashAttention import flash_attn_forward, flash_attn_backward
 
 def _to_multihead(input: Tensor, emb_dim: int, num_heads: int) -> Tensor:
     input = input.unsqueeze(0) if len(input.shape) == 1 else input
@@ -36,8 +37,18 @@ class MultiheadAttentionFunction(torch.autograd.Function):
         num_heads: int,
         key_padding_mask: Tensor | None=None,
         attn_mask: Tensor | None=None,
-        is_causal: bool=False
+        is_causal: bool=False,
+        flash_attn: bool=True
     ):
+        ctx.flash_attn = flash_attn
+        ctx.is_causal = is_causal
+        if ctx.flash_attn:
+
+            O, L = flash_attn_forward(Q, K, V, is_causal, Q.device)
+            ctx.save_for_backward(Q, K, V, O, L)
+
+            return _from_multihead(O, emb_dim)
+        
         ctx.num_heads = num_heads
         ctx.emb_dim = emb_dim
         ctx.batch_dims = Q.shape[:-3]       # CORE CHANGE: was query.shape[:-2]
@@ -65,7 +76,7 @@ class MultiheadAttentionFunction(torch.autograd.Function):
                 raise KeyError(f"attn_mask must have shape (seq_q, seq_k) or (N * num_heads, seq_q, seq_k), but got {attn_mask.shape}")
             A = A + attn_mask if attn_mask.dtype != torch.bool else A.masked_fill(attn_mask, float('-inf'))
 
-        if is_causal:
+        if ctx.is_causal:
             mask = (float('-inf') * torch.ones((seq_q, seq_k))).triu(1)
             A += mask
 
@@ -81,17 +92,21 @@ class MultiheadAttentionFunction(torch.autograd.Function):
         # CORE CHANGE: backward is significantly simpler — no W_q/W_k/W_v/W_o gradients,
         # no recomputation of Q/K/V. Just returns grad_Q, grad_K, grad_V in multihead format;
         # autograd propagates the rest back through _to_multihead and the projections.
-        Q, K, V, attn_map = ctx.saved_tensors
+        
+        if ctx.flash_attn:
+            Q, K, V, O, L = ctx.saved_tensors
+            grad_Q, grad_K, grad_V = flash_attn_backward(Q, K, V, O, L, grad_upstream, is_causal=ctx.is_causal, device=grad_upstream.device)
+        else:
+            grad_attn_output = _to_multihead(grad_upstream, ctx.emb_dim, ctx.num_heads)
+    
+            Q, K, V, attn_map = ctx.saved_tensors
+            grad_V = attn_map.mT @ grad_attn_output if ctx.needs_input_grad[2] else None
 
-        grad_attn_output = _to_multihead(grad_upstream, ctx.emb_dim, ctx.num_heads)
+            grad_attn_map = grad_attn_output @ V.mT
+            grad_A = attn_map * (grad_attn_map - (grad_attn_map * attn_map).sum(dim=-1, keepdim=True)) / math.sqrt(K.shape[-1])
 
-        grad_V = attn_map.mT @ grad_attn_output if ctx.needs_input_grad[2] else None
-
-        grad_attn_map = grad_attn_output @ V.mT
-        grad_A = attn_map * (grad_attn_map - (grad_attn_map * attn_map).sum(dim=-1, keepdim=True)) / math.sqrt(K.shape[-1])
-
-        grad_Q = grad_A @ K   if ctx.needs_input_grad[0] else None
-        grad_K = grad_A.mT @ Q if ctx.needs_input_grad[1] else None
+            grad_Q = grad_A @ K   if ctx.needs_input_grad[0] else None
+            grad_K = grad_A.mT @ Q if ctx.needs_input_grad[1] else None
 
         return (
             grad_Q,   # 0: Q
@@ -102,6 +117,7 @@ class MultiheadAttentionFunction(torch.autograd.Function):
             None,     # 5: key_padding_mask
             None,     # 6: attn_mask
             None,     # 7: is_causal
+            None,     # 8: flash_attn
         )
 
 
@@ -117,6 +133,7 @@ class MultiheadAttention(nn.Module):
             device: torch.device=None,
             kdim: int=None,
             vdim: int=None,
+            flash_attn: bool=True,
             dtype: torch.dtype=None
         ):
         super().__init__()
@@ -124,6 +141,8 @@ class MultiheadAttention(nn.Module):
         assert embed_dim % num_heads == 0, "num_heads must divide embed_dim"
         self.num_heads = num_heads
         self.emb_dim = embed_dim
+        self.flash_attn = flash_attn
+        
         self.proj_q = Linear(embed_dim, embed_dim,              bias=bias,       device=device, dtype=dtype)
         self.proj_k = Linear(embed_dim, kdim or embed_dim,     bias=add_bias_kv, device=device, dtype=dtype)
         self.proj_v = Linear(embed_dim, vdim or embed_dim,     bias=add_bias_kv, device=device, dtype=dtype)
@@ -153,6 +172,7 @@ class MultiheadAttention(nn.Module):
             Q, K, V,
             self.emb_dim, self.num_heads,
             key_padding_mask, attn_mask, is_causal,
+            self.flash_attn
         )
 
         return self.proj_o(attn_output)
