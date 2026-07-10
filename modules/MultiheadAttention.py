@@ -42,6 +42,8 @@ class MultiheadAttentionFunction(torch.autograd.Function):
     ):
         ctx.flash_attn = flash_attn
         ctx.is_causal = is_causal
+        ctx.num_heads = num_heads
+        ctx.emb_dim = emb_dim
         if ctx.flash_attn:
 
             O, L = flash_attn_forward(Q, K, V, is_causal, Q.device)
@@ -49,8 +51,6 @@ class MultiheadAttentionFunction(torch.autograd.Function):
 
             return _from_multihead(O, emb_dim)
         
-        ctx.num_heads = num_heads
-        ctx.emb_dim = emb_dim
         ctx.batch_dims = Q.shape[:-3]       # CORE CHANGE: was query.shape[:-2]
         N = math.prod(ctx.batch_dims)
 
@@ -77,7 +77,7 @@ class MultiheadAttentionFunction(torch.autograd.Function):
             A = A + attn_mask if attn_mask.dtype != torch.bool else A.masked_fill(attn_mask, float('-inf'))
 
         if ctx.is_causal:
-            mask = (float('-inf') * torch.ones((seq_q, seq_k))).triu(1)
+            mask = (float('-inf') * torch.ones((seq_q, seq_k), device=A.device)).triu(1)
             A += mask
 
         attn_map = torch.softmax(A / math.sqrt(K.shape[-1]), dim=-1)
@@ -95,7 +95,7 @@ class MultiheadAttentionFunction(torch.autograd.Function):
         
         if ctx.flash_attn:
             Q, K, V, O, L = ctx.saved_tensors
-            grad_Q, grad_K, grad_V = flash_attn_backward(Q, K, V, O, L, grad_upstream, is_causal=ctx.is_causal, device=grad_upstream.device)
+            grad_Q, grad_K, grad_V = flash_attn_backward(Q, K, V, O, L, _to_multihead(grad_upstream, ctx.emb_dim, ctx.num_heads), is_causal=ctx.is_causal, device=grad_upstream.device)
         else:
             grad_attn_output = _to_multihead(grad_upstream, ctx.emb_dim, ctx.num_heads)
     
