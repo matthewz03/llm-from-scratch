@@ -54,11 +54,11 @@ if __name__ == "__main__":
     
     mha_naive = lambda Q, K, V: MultiheadAttentionFunction.apply(
             Q, K, V,
-            DIM, n_heads, None, None, False, False)
+            n_heads * DIM, n_heads, None, None, False, False)
     
     mha_flash = lambda Q, K, V: MultiheadAttentionFunction.apply(
             Q, K, V,
-            DIM, n_heads, None, None, False, True)
+            n_heads * DIM, n_heads, None, None, False, True)
 
     naive_func = run_4d(3, (batch_size, n_heads, N, DIM), mha_naive, torch.device("cuda"))
     flash_func = run_4d(3, (batch_size, n_heads, N, DIM), mha_flash, torch.device("cuda"))
