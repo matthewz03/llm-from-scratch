@@ -3,6 +3,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import torch
 from typing import Callable, Tuple
+import argparse
+
 from modules.MultiheadAttention import MultiheadAttentionFunction
 
 
@@ -37,23 +39,38 @@ def run_4d(n_args: int, size: Tuple, func: Callable, device: torch.device | None
 
 if __name__ == "__main__":
 
-    batch_size = 32
-    n_heads = 64
-    N = 128
-    DIM = 64
+    parser = argparse.ArgumentParser(description="Benchmark naive attention vs flash attention")
+    parser.add_argument("-b", "--batch", type=int, default=2, help="tensor batch size")
+    parser.add_argument("-h", "--heads", type=int, default=8, help="tensor head size")
+    parser.add_argument("-s", "--seq_len", type=int, default=2048, help="tensor sequence length")
+    parser.add_argument("-d", "--dims", type=int, default=32, help="tensor feature dim size")
+
+    args = parser.parse_args()
+
+    batch_size = args.batch
+    n_heads = args.heads
+    N = args.seq_len
+    DIM = args.dims
+    
     mha_naive = lambda Q, K, V: MultiheadAttentionFunction.apply(
             Q, K, V,
-            DIM, n_heads, flash_attn=False)
+            DIM, n_heads, None, None, False, False)
     
     mha_flash = lambda Q, K, V: MultiheadAttentionFunction.apply(
             Q, K, V,
-            DIM, n_heads, flash_attn=True)
+            DIM, n_heads, None, None, False, True)
 
     naive_func = run_4d(3, (batch_size, n_heads, N, DIM), mha_naive, torch.device("cuda"))
     flash_func = run_4d(3, (batch_size, n_heads, N, DIM), mha_flash, torch.device("cuda"))
     
-    avg_time_naive = benchmark(naive_func)
-    avg_time_flash = benchmark(flash_func)
+    with torch.cuda.nvtx.range("naive"):
+        avg_time_naive = benchmark(naive_func)
+    
+    with torch.cuda.nvtx.range("flash"):
+        avg_time_flash = benchmark(flash_func)
 
-    print(f"Average time for MultiheadAttentionFunction.apply with batch_size={batch_size}, n_heads={n_heads}, N={N}, DIM={DIM}: {avg_time_naive:.4f} ms")
-    print(f"Average time for MultiheadAttentionFunction.apply with batch_size={batch_size}, n_heads={n_heads}, N={N}, DIM={DIM}: {avg_time_flash:.4f} ms")
+    speedup = avg_time_naive / avg_time_flash
+    print(f"Config: batch={batch_size}, heads={n_heads}, seq_len={N}, head_dim={DIM}")
+    print(f"  Naive attention : {avg_time_naive:.4f} ms")
+    print(f"  Flash attention : {avg_time_flash:.4f} ms")
+    print(f"  Speedup         : {speedup:.2f}x")
