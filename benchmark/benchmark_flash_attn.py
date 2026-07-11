@@ -8,7 +8,7 @@ import argparse
 from modules.MultiheadAttention import MultiheadAttentionFunction
 
 
-def benchmark(func: Callable, n_trials: int=10, n_warmups: int=5):
+def benchmark(func: Callable, n_trials: int=10, n_warmups: int=5, nvtx_label: str | None=None):
 
     for _ in range(n_warmups):
         func()
@@ -20,9 +20,10 @@ def benchmark(func: Callable, n_trials: int=10, n_warmups: int=5):
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
 
-        start.record()
-        func()
-        end.record()
+        with torch.cuda.nvtx.range(nvtx_label or ""):
+            start.record()
+            func()
+            end.record()
 
         torch.cuda.synchronize()
 
@@ -66,11 +67,8 @@ if __name__ == "__main__":
     naive_func = run_4d(3, (batch_size, n_heads, N, DIM), mha_naive, torch.device("cuda"))
     flash_func = run_4d(3, (batch_size, n_heads, N, DIM), mha_flash, torch.device("cuda"))
     
-    with torch.cuda.nvtx.range("naive"):
-        avg_time_naive = benchmark(naive_func)
-    
-    with torch.cuda.nvtx.range("flash"):
-        avg_time_flash = benchmark(flash_func)
+    avg_time_naive = benchmark(naive_func, nvtx_label="naive")
+    avg_time_flash = benchmark(flash_func, nvtx_label="flash")
 
     speedup = avg_time_naive / avg_time_flash
     print(f"Config: batch={batch_size}, heads={n_heads}, seq_len={N}, head_dim={DIM}")
