@@ -43,7 +43,8 @@ if __name__ == "__main__":
     parser.add_argument("-b", "--batch", type=int, default=2, help="tensor batch size")
     parser.add_argument("-H", "--heads", type=int, default=8, help="tensor head size")
     parser.add_argument("-s", "--seq_len", type=int, default=2048, help="tensor sequence length")
-    parser.add_argument("-d", "--dims", type=int, default=32, help="tensor feature dim size")
+    parser.add_argument("-d", "--dims", type=int, default=32, help="tensor head dim size")
+    parser.add_argument("-c", "--causal", type=bool, default=False, help="If attention is causal i.e. autoregressive")
 
     args = parser.parse_args()
 
@@ -51,14 +52,16 @@ if __name__ == "__main__":
     n_heads = args.heads
     N = args.seq_len
     DIM = args.dims
+
+    is_causal = args.causal
     
     mha_naive = lambda Q, K, V: MultiheadAttentionFunction.apply(
             Q, K, V,
-            n_heads * DIM, n_heads, None, None, False, False)
+            n_heads * DIM, n_heads, None, None, is_causal, False)
     
     mha_flash = lambda Q, K, V: MultiheadAttentionFunction.apply(
             Q, K, V,
-            n_heads * DIM, n_heads, None, None, False, True)
+            n_heads * DIM, n_heads, None, None, is_causal, True)
 
     naive_func = run_4d(3, (batch_size, n_heads, N, DIM), mha_naive, torch.device("cuda"))
     flash_func = run_4d(3, (batch_size, n_heads, N, DIM), mha_flash, torch.device("cuda"))
