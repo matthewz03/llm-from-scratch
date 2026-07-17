@@ -115,7 +115,7 @@ def benchmark_sequences(args):
 def benchmark_single(args):
     batch_size = args.batch
     n_heads = args.heads
-    N = args.seq_lens
+    N = args.seq_lens[0]
     DIM = args.dims
 
     is_causal = args.causal
