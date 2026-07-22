@@ -151,9 +151,9 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Benchmark naive attention vs flash attention")
     parser.add_argument("-b", "--batch", type=int, default=2, help="tensor batch size")
-    parser.add_argument("-H", "--heads", type=int, default=8, help="tensor head size")
+    parser.add_argument("-H", "--heads", type=int, default=32, help="tensor head size")
     parser.add_argument("-s", "--seq_lens", type=int, nargs="+", default=[512, 1024, 2048, 4096], help="tensor sequence lengths")
-    parser.add_argument("-d", "--dims", type=int, default=32, help="tensor head dim size")
+    parser.add_argument("-d", "--dims", type=int, default=64, help="tensor head dim size")
     parser.add_argument("-c", "--causal", action="store_true", help="If attention is causal i.e. autoregressive")
     parser.add_argument("--fig_path", type=str, default=None, help="Path to save the benchmark figure")
     parser.add_argument("--single", action="store_true", help="Benchmark a single sequence length instead of multiple")
